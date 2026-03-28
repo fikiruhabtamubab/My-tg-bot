@@ -20,14 +20,15 @@ from telegram.error import BadRequest, Forbidden
 
 # --- 1. CONFIGURATION & SECRETS ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID_RAW = os.getenv("ADMIN_ID", "5815604554")
+ADMIN_ID_STR = os.getenv("ADMIN_ID", "5815604554")
 PORT = int(os.getenv("PORT", 8080))
 
 try:
-    ADMIN_ID = int(ADMIN_ID_RAW.strip())
+    ADMIN_ID = int(ADMIN_ID_STR.strip())
 except:
     ADMIN_ID = 5815604554
 
+# Global Settings
 DB_FILE = "user_data.db"
 REFERRAL_BONUS = 0.05
 DAILY_BONUS = 0.05
@@ -36,21 +37,20 @@ MIN_WITHDRAWAL = 5.00
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- 2. STATES FOR CONVERSATIONS ---
 class State(Enum):
-    # Task Add
-    T_NAME = 1; T_ID = 2; T_URL = 3; T_REWARD = 4
-    # Withdraw
-    W_NET = 5; W_ADDR = 6; W_AMT = 7
-    # Mail
-    M_MSG = 8; M_BTN = 9; M_BTN_DATA = 10
-    # Track Main
+    # Mailing
+    M_MSG = 1; M_BTN = 2; M_BTN_DATA = 3
+    # Tasks
+    T_NAME = 4; T_ID = 5; T_URL = 6; T_REWARD = 7
+    # Coupons
+    C_BUDGET = 8; C_CLAIMS = 9; C_CLAIM_INPUT = 10
+    # Main Tracking
     TR_NAME = 11; TR_ID = 12; TR_URL = 13
-    # Coupon
-    C_BUDGET = 14; C_CLAIMS = 15; C_CODE = 16
-    # Coupon Track
-    CT_NAME = 17; CT_ID = 18; CT_URL = 19
+    # Withdraw
+    W_NET = 14; W_ADDR = 15; W_AMT = 16
 
-# --- 2. DATABASE HELPER ---
+# --- 3. DATABASE HELPER ---
 def db_query(query, params=(), commit=False, fetchone=False, fetchall=False):
     with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
         cursor = conn.cursor()
@@ -62,6 +62,269 @@ def db_query(query, params=(), commit=False, fetchone=False, fetchall=False):
 
 def setup_database():
     queries = [
+        "CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, balance REAL DEFAULT 0, last_bonus_claim DATE, referral_count INTEGER DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS tasks (task_id INTEGER PRIMARY KEY AUTOINCREMENT, task_name TEXT, reward REAL, target_chat_id TEXT, task_url TEXT, status TEXT DEFAULT 'active')",
+        "CREATE TABLE IF NOT EXISTS completed_tasks (user_id INTEGER, task_id INTEGER, PRIMARY KEY (user_id, task_id))",
+        "CREATE TABLE IF NOT EXISTS withdrawals (withdrawal_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL, network TEXT, wallet_address TEXT, status TEXT DEFAULT 'pending')",
+        "CREATE TABLE IF NOT EXISTS forced_channels (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_name TEXT, channel_id TEXT UNIQUE, channel_url TEXT, status TEXT DEFAULT 'active')",
+        "CREATE TABLE IF NOT EXISTS coupons (coupon_code TEXT PRIMARY KEY, budget REAL, max_claims INTEGER, claims_count INTEGER DEFAULT 0, status TEXT DEFAULT 'active')",
+        "CREATE TABLE IF NOT EXISTS claimed_coupons (user_id INTEGER, coupon_code TEXT, PRIMARY KEY (user_id, coupon_code))"
+    ]
+    for q in queries: db_query(q, commit=True)
+
+# --- 4. KEYBOARDS ---
+def user_kb(uid):
+    btns = [
+        [KeyboardButton("💰 Balance"), KeyboardButton("👥 Referral")],
+        [KeyboardButton("🎁 Daily Bonus"), KeyboardButton("📋 Tasks")],
+        [KeyboardButton("💸 Withdraw"), KeyboardButton("🎟️ Coupon Code")]
+    ]
+    if uid == ADMIN_ID: btns.append([KeyboardButton("👑 Admin Panel")])
+    return ReplyKeyboardMarkup(btns, resize_keyboard=True)
+
+def admin_kb():
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("📧 Mailing"), KeyboardButton("📋 Task Management")],
+        [KeyboardButton("🎟️ Coupon Management"), KeyboardButton("📊 Bot Stats")],
+        [KeyboardButton("🏧 Withdrawals"), KeyboardButton("🔗 Main Track Management")],
+        [KeyboardButton("⬅️ Back to User Menu")]
+    ], resize_keyboard=True)
+
+# --- 5. ACCESS CONTROL (FORCED JOIN) ---
+async def check_joined(uid, context):
+    channels = db_query("SELECT channel_name, channel_id, channel_url FROM forced_channels WHERE status='active'", fetchall=True)
+    unjoined = []
+    for name, cid, url in channels:
+        try:
+            m = await context.bot.get_chat_member(cid, uid)
+            if m.status not in ['member', 'administrator', 'creator']: unjoined.append((name, url))
+        except: unjoined.append((name, url))
+    return unjoined
+
+async def gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid == ADMIN_ID: return True
+    unjoined = await check_joined(uid, context)
+    if unjoined:
+        kb = [[InlineKeyboardButton(f"Join {n}", url=u)] for n, u in unjoined]
+        kb.append([InlineKeyboardButton("✅ Verified - Start", callback_data="verify_main")])
+        msg = "⚠️ **Access Denied**\nYou must join our channels to unlock the bot features:"
+        target = update.message or update.callback_query.message
+        await target.reply_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        return False
+    return True
+
+# --- 6. USER HANDLERS ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if context.args and not db_query("SELECT 1 FROM users WHERE user_id=?", (user.id,), fetchone=True):
+        try:
+            ref_id = int(context.args[0])
+            if ref_id != user.id:
+                db_query("INSERT OR IGNORE INTO users (user_id, username, balance, referral_count) VALUES (?,?,0,0)", (user.id, user.username), commit=True)
+                db_query("UPDATE users SET balance=balance+?, referral_count=referral_count+1 WHERE user_id=?", (REFERRAL_BONUS, ref_id), commit=True)
+                try: await context.bot.send_message(ref_id, f"🎉 New Referral! You earned ${REFERRAL_BONUS}")
+                except: pass
+        except: pass
+    db_query("INSERT OR IGNORE INTO users (user_id, username) VALUES (?,?)", (user.id, user.username), commit=True)
+    await update.message.reply_text(f"👋 Welcome {user.first_name}!", reply_markup=user_kb(user.id))
+
+async def balance_cmd(update, context):
+    if not await gatekeeper(update, context): return
+    res = db_query("SELECT balance FROM users WHERE user_id=?", (update.effective_user.id,), fetchone=True)
+    bal = res[0] if res else 0.0
+    await update.message.reply_text(f"💰 Balance: **${bal:.2f}**", parse_mode='Markdown')
+
+async def referral_cmd(update, context):
+    if not await gatekeeper(update, context): return
+    uid = update.effective_user.id
+    res = db_query("SELECT referral_count FROM users WHERE user_id=?", (uid,), fetchone=True)
+    cnt = res[0] if res else 0
+    bot = await context.bot.get_me()
+    link = f"https://t.me/{bot.username}?start={uid}"
+    await update.message.reply_text(f"👥 Referrals: {cnt}\nLink: `{link}`", parse_mode='Markdown')
+
+async def daily_cmd(update, context):
+    if not await gatekeeper(update, context): return
+    uid, today = update.effective_user.id, date.today().isoformat()
+    res = db_query("SELECT last_bonus_claim FROM users WHERE user_id=?", (uid,), fetchone=True)
+    if res and res[0] == today:
+        await update.message.reply_text("❌ Already claimed today!")
+    else:
+        db_query("UPDATE users SET balance=balance+?, last_bonus_claim=? WHERE user_id=?", (DAILY_BONUS, today, uid), commit=True)
+        await update.message.reply_text(f"🎁 Claimed ${DAILY_BONUS} bonus!")
+
+# --- 7. ADMIN MENU HANDLERS ---
+async def admin_panel_start(update, context):
+    if update.effective_user.id == ADMIN_ID:
+        await update.message.reply_text("👑 Admin Control Panel", reply_markup=admin_kb())
+
+async def admin_stats(update, context):
+    if update.effective_user.id != ADMIN_ID: return
+    count = db_query("SELECT COUNT(*) FROM users", fetchone=True)[0]
+    kb = [[InlineKeyboardButton("📥 Export User IDs", callback_data="a_export")]]
+    await update.message.reply_text(f"📊 Total Users: {count}", reply_markup=InlineKeyboardMarkup(kb))
+
+async def admin_tasks(update, context):
+    if update.effective_user.id != ADMIN_ID: return
+    kb = [[InlineKeyboardButton("➕ Add Task", callback_data="a_t_add")]]
+    await update.message.reply_text("📋 Task Management", reply_markup=InlineKeyboardMarkup(kb))
+
+async def admin_coupons(update, context):
+    if update.effective_user.id != ADMIN_ID: return
+    kb = [[InlineKeyboardButton("➕ Create Coupon", callback_data="a_c_add")]]
+    await update.message.reply_text("🎟️ Coupon Management", reply_markup=InlineKeyboardMarkup(kb))
+
+async def admin_withdrawals(update, context):
+    if update.effective_user.id != ADMIN_ID: return
+    ws = db_query("SELECT withdrawal_id, user_id, amount FROM withdrawals WHERE status='pending'", fetchall=True)
+    if not ws: await update.message.reply_text("🏧 No pending requests."); return
+    for w in ws:
+        kb = [[InlineKeyboardButton("Approve", callback_data=f"a_w_a_{w[0]}"), InlineKeyboardButton("Reject", callback_data=f"a_w_r_{w[0]}")]]
+        await update.message.reply_text(f"ID: {w[0]} | User: {w[1]} | Amt: ${w[2]}", reply_markup=InlineKeyboardMarkup(kb))
+
+async def admin_track(update, context):
+    if update.effective_user.id != ADMIN_ID: return
+    kb = [[InlineKeyboardButton("➕ Add Channel", callback_data="a_tr_add")]]
+    await update.message.reply_text("🔗 Track Management", reply_markup=InlineKeyboardMarkup(kb))
+
+# --- 8. ADMIN CONVERSATIONS ---
+
+# Mailing
+async def mail_start(update, context):
+    if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
+    await update.message.reply_text("Send message to broadcast:", reply_markup=ReplyKeyboardRemove())
+    return State.M_MSG
+
+async def mail_msg(update, context):
+    context.user_data['m_msg'] = update.message; context.user_data['m_btns'] = []
+    kb = [[InlineKeyboardButton("➕ Add Button", callback_data="a_m_btn"), InlineKeyboardButton("🚀 Send Now", callback_data="a_m_send")]]
+    await update.message.reply_text("Add button or send?", reply_markup=InlineKeyboardMarkup(kb))
+    return State.M_BTN
+
+# Task Add
+async def task_add_start(update, context):
+    await update.callback_query.answer()
+    await update.callback_query.message.reply_text("Enter Task Name:", reply_markup=ReplyKeyboardRemove())
+    return State.T_NAME
+
+async def task_name(update, context):
+    context.user_data['t_n'] = update.message.text
+    await update.message.reply_text("Channel ID (@mychan):")
+    return State.T_ID
+
+async def task_id(update, context):
+    context.user_data['t_i'] = update.message.text
+    await update.message.reply_text("Link (https://...):")
+    return State.T_URL
+
+async def task_url(update, context):
+    context.user_data['t_u'] = update.message.text
+    await update.message.reply_text("Reward (e.g. 0.10):")
+    return State.T_REWARD
+
+async def task_final(update, context):
+    try:
+        r = float(update.message.text)
+        db_query("INSERT INTO tasks (task_name, target_chat_id, task_url, reward) VALUES (?,?,?,?)", 
+                 (context.user_data['t_n'], context.user_data['t_i'], context.user_data['t_u'], r), commit=True)
+        await update.message.reply_text("✅ Task Added!", reply_markup=admin_kb())
+        return ConversationHandler.END
+    except: await update.message.reply_text("Error: Enter a number"); return State.T_REWARD
+
+# Coupon Add
+async def coupon_add_start(update, context):
+    await update.callback_query.answer()
+    await update.callback_query.message.reply_text("Budget per claim:", reply_markup=ReplyKeyboardRemove())
+    return State.C_BUDGET
+
+async def coupon_budget(update, context):
+    context.user_data['c_b'] = float(update.message.text)
+    await update.message.reply_text("Max Claims:")
+    return State.C_CLAIMS
+
+async def coupon_final(update, context):
+    code = f"C-{random.randint(10000, 99999)}"
+    db_query("INSERT INTO coupons (coupon_code, budget, max_claims) VALUES (?,?,?)", 
+             (code, context.user_data['c_b'], int(update.message.text)), commit=True)
+    await update.message.reply_text(f"✅ Created: `{code}`", reply_markup=admin_kb())
+    return ConversationHandler.END
+
+# --- 9. CALLBACK MASTER ---
+async def callback_handler(update, context):
+    q = update.callback_query; d = q.data; uid = q.from_user.id
+    await q.answer()
+    if d == "verify_main":
+        if await gatekeeper(update, context): await q.edit_message_text("✅ Verified!")
+    elif d == "a_m_btn":
+        await q.edit_message_text("Send: `Text - URL`", parse_mode='Markdown'); return State.M_BTN_DATA
+    elif d == "a_m_send":
+        users = db_query("SELECT user_id FROM users", fetchall=True)
+        kb = InlineKeyboardMarkup([context.user_data['m_btns']]) if context.user_data['m_btns'] else None
+        for (u,) in users:
+            try: await context.user_data['m_msg'].copy(u, reply_markup=kb)
+            except: pass
+        await q.message.reply_text("📢 Broadcast Done!", reply_markup=admin_kb())
+    elif d == "a_export":
+        ids = db_query("SELECT user_id FROM users", fetchall=True)
+        out = io.BytesIO("\n".join([str(i[0]) for i in ids]).encode()); out.name = "users.txt"
+        await context.bot.send_document(uid, out)
+    elif d.startswith("a_w_a_"):
+        wid = d.split("_")[3]
+        db_query("UPDATE withdrawals SET status='approved' WHERE withdrawal_id=?", (wid,), commit=True)
+        await q.edit_message_text("✅ Approved.")
+    elif d.startswith("a_w_r_"):
+        wid = d.split("_")[3]
+        r = db_query("SELECT user_id, amount FROM withdrawals WHERE withdrawal_id=?", (wid,), fetchone=True)
+        db_query("UPDATE withdrawals SET status='rejected' WHERE withdrawal_id=?", (wid,), commit=True)
+        db_query("UPDATE users SET balance=balance+? WHERE user_id=?", (r[1], r[0]), commit=True)
+        await q.edit_message_text("❌ Rejected. Refunded.")
+
+# --- 10. HEALTH SERVER & MAIN ---
+class Health(BaseHTTPRequestHandler):
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+def run_h(): HTTPServer(('0.0.0.0', PORT), Health).serve_forever()
+
+def main():
+    if not BOT_TOKEN: return
+    setup_database()
+    threading.Thread(target=run_h, daemon=True).start()
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Conversation Handlers
+    app.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📧 Mailing$"), mail_start)],
+        states={State.M_MSG: [MessageHandler(filters.ALL, mail_msg)], State.M_BTN: [CallbackQueryHandler(callback_handler)]},
+        fallbacks=[]
+    ))
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(task_add_start, pattern="^a_t_add$")],
+        states={State.T_NAME: [MessageHandler(filters.TEXT, task_name)], State.T_ID: [MessageHandler(filters.TEXT, task_id)], State.T_URL: [MessageHandler(filters.TEXT, task_url)], State.T_REWARD: [MessageHandler(filters.TEXT, task_final)]},
+        fallbacks=[]
+    ))
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(coupon_add_start, pattern="^a_c_add$")],
+        states={State.C_BUDGET: [MessageHandler(filters.TEXT, coupon_budget)], State.C_CLAIMS: [MessageHandler(filters.TEXT, coupon_final)]},
+        fallbacks=[]
+    ))
+
+    # Static Handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Regex("^💰 Balance$"), balance_cmd))
+    app.add_handler(MessageHandler(filters.Regex("^👥 Referral$"), referral_cmd))
+    app.add_handler(MessageHandler(filters.Regex("^🎁 Daily Bonus$"), daily_cmd))
+    app.add_handler(MessageHandler(filters.Regex("^👑 Admin Panel$"), admin_panel_start))
+    app.add_handler(MessageHandler(filters.Regex("^📊 Bot Stats$"), admin_stats))
+    app.add_handler(MessageHandler(filters.Regex("^📋 Task Management$"), admin_tasks))
+    app.add_handler(MessageHandler(filters.Regex("^🎟️ Coupon Management$"), admin_coupons))
+    app.add_handler(MessageHandler(filters.Regex("^🏧 Withdrawals$"), admin_withdrawals))
+    app.add_handler(MessageHandler(filters.Regex("^🔗 Main Track Management$"), admin_track))
+    app.add_handler(MessageHandler(filters.Regex("^⬅️ Back to User Menu$"), start))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+
+    app.run_polling()
+
+if __name__ == "__main__": main()    queries = [
         "CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, balance REAL DEFAULT 0, last_bonus_claim DATE, referred_by INTEGER, referral_count INTEGER DEFAULT 0)",
         "CREATE TABLE IF NOT EXISTS tasks (task_id INTEGER PRIMARY KEY AUTOINCREMENT, task_name TEXT, reward REAL, target_chat_id TEXT, task_url TEXT, status TEXT DEFAULT 'active')",
         "CREATE TABLE IF NOT EXISTS completed_tasks (user_id INTEGER, task_id INTEGER, PRIMARY KEY (user_id, task_id))",
