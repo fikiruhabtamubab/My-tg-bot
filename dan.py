@@ -18,7 +18,16 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest, Forbidden
 
-# --- Configuration (Choreo Environment Variables) ---
+# --- Choreo Persistence & Configuration ---
+# 1. Define the Data Directory (Default to 'data' folder if not provided)
+DATA_DIR = os.getenv("DATA_DIR", "data")
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+# 2. Define DB Path inside the Data Directory
+DB_FILE = os.path.join(DATA_DIR, "user_data.db")
+
+# 3. Environment Secrets
 BOT_API_KEY = os.getenv("BOT_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 PORT = int(os.getenv("PORT", 8080)) # Choreo provides this automatically
@@ -26,7 +35,6 @@ PORT = int(os.getenv("PORT", 8080)) # Choreo provides this automatically
 REFERRAL_BONUS = 0.05
 DAILY_BONUS = 0.05
 MIN_WITHDRAWAL_LIMIT = 5.00
-DB_FILE = os.getenv("DB_PATH", "user_data.db") # Ensure this path is in a Persistent Volume
 
 # --- Health Check Server for Choreo ---
 # Choreo expects the container to listen on the $PORT to pass health checks.
