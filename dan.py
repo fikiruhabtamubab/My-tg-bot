@@ -5,7 +5,7 @@ import os
 import random
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from enum import Enum
 
 from telegram import (
@@ -718,7 +718,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                 # POST TO PROOF CHANNEL
                 proof_chan = c.execute("SELECT value FROM settings WHERE key = 'proof_channel_id'").fetchone()
                 if proof_chan:
-                    time_now = datetime.now().strftime("%-m/%-d/%Y %-I:%M:%S %p")
+                    time_now = (datetime.now() + timedelta(hours=3)).strftime("%-m/%-d/%Y %-I:%M:%S %p")
                     proof_msg = (f"🔎 Withdrawal Details\n"
                                  f"🆔 ID: {withdrawal_id}\n"
                                  f"👤 User: {first_name} ({w_user_id})\n"
