@@ -63,14 +63,20 @@ class State(Enum):
     GET_COUPON_BUDGET = 14; GET_COUPON_MAX_CLAIMS = 15
     AWAIT_COUPON_CODE = 16
     GET_COUPON_TRACKED_NAME = 17; GET_COUPON_TRACKED_ID = 18; GET_COUPON_TRACKED_URL = 19
-    SET_PROOF_CHANNEL = 20 # ADDED: State for setting payment channel
+    SET_PROOF_CHANNEL = 20 # State for Proof Channel setting
 
 # --- Database Setup ---
 def setup_database():
     with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
         c = conn.cursor()
-        # ADDED first_name column to users table
+        # Ensure users table has first_name column
         c.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, balance REAL DEFAULT 0, last_bonus_claim DATE, referred_by INTEGER, referral_count INTEGER DEFAULT 0)")
+        # For existing databases, add first_name column if it doesn't exist
+        try:
+            c.execute("ALTER TABLE users ADD COLUMN first_name TEXT")
+        except sqlite3.OperationalError:
+            pass # Column already exists
+            
         c.execute("CREATE TABLE IF NOT EXISTS tasks (task_id INTEGER PRIMARY KEY AUTOINCREMENT, task_name TEXT NOT NULL, reward REAL NOT NULL, target_chat_id TEXT NOT NULL, task_url TEXT NOT NULL, status TEXT DEFAULT 'active')")
         c.execute("CREATE TABLE IF NOT EXISTS completed_tasks (user_id INTEGER, task_id INTEGER, PRIMARY KEY (user_id, task_id))")
         c.execute("CREATE TABLE IF NOT EXISTS withdrawals (withdrawal_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, amount REAL NOT NULL, network TEXT NOT NULL, wallet_address TEXT NOT NULL, status TEXT DEFAULT 'pending', request_date DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (user_id) REFERENCES users (user_id))")
@@ -79,7 +85,7 @@ def setup_database():
         c.execute("CREATE TABLE IF NOT EXISTS claimed_coupons (user_id INTEGER, coupon_code TEXT, PRIMARY KEY (user_id, coupon_code))")
         c.execute("CREATE TABLE IF NOT EXISTS coupon_forced_channels (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_name TEXT, channel_id TEXT UNIQUE, channel_url TEXT, status TEXT DEFAULT 'active')")
         c.execute("CREATE TABLE IF NOT EXISTS coupon_messages (coupon_code TEXT, chat_id INTEGER, message_id INTEGER, PRIMARY KEY (coupon_code, chat_id))")
-        # ADDED: Settings table to store Proof Channel ID
+        # ADDED Settings table
         c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         conn.commit()
 
@@ -94,7 +100,7 @@ def get_admin_keyboard():
         [KeyboardButton("📧 Mailing"), KeyboardButton("📋 Task Management")],
         [KeyboardButton("🎟️ Coupon Management"), KeyboardButton("📊 Bot Stats")],
         [KeyboardButton("🏧 Withdrawals"), KeyboardButton("🔗 Main Track Management")],
-        [KeyboardButton("📢 Proof Channel"), KeyboardButton("⬅️ Back to User Menu")], # ADDED: Proof Channel Button
+        [KeyboardButton("📢 Proof Channel"), KeyboardButton("⬅️ Back to User Menu")],
     ]
     return ReplyKeyboardMarkup(admin_buttons, resize_keyboard=True)
 
@@ -179,7 +185,6 @@ async def check_membership_and_grant_access(update: Update, context: ContextType
             referrer_id = context.user_data.get('referrer_id')
             if is_new_user and referrer_id:
                 if c.execute("SELECT user_id FROM users WHERE user_id = ?", (referrer_id,)).fetchone():
-                    # UPDATED: Added user.first_name to INSERT
                     c.execute("INSERT INTO users (user_id, username, first_name, balance, referred_by) VALUES (?, ?, ?, ?, ?)", (user.id, user.username, user.first_name, REFERRAL_BONUS, referrer_id))
                     c.execute("UPDATE users SET balance = balance + ?, referral_count = referral_count + 1 WHERE user_id = ?", (REFERRAL_BONUS, referrer_id))
                     conn.commit()
@@ -193,7 +198,7 @@ async def check_membership_and_grant_access(update: Update, context: ContextType
                 del context.user_data['referrer_id']
             else:
                 c.execute("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)", (user.id, user.username, user.first_name))
-                c.execute("UPDATE users SET first_name = ? WHERE user_id = ?", (user.first_name, user.id)) # Ensure first name is current
+                c.execute("UPDATE users SET first_name = ? WHERE user_id = ?", (user.first_name, user.id))
                 conn.commit()
 
             await update.effective_message.reply_text(welcome_message, reply_markup=get_user_keyboard(user.id), parse_mode='Markdown')
@@ -263,16 +268,16 @@ async def admin_back_to_user_menu(update: Update, context: ContextTypes.DEFAULT_
     context.user_data["from_admin_back"] = True
     await start(update, context)
 
-# ADDED: Proof Channel Setting Handlers
+# --- PROOF CHANNEL HANDLERS ---
 async def handle_admin_proof_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ADMIN_ID: return
     with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
         c = conn.cursor()
         current_proof = c.execute("SELECT value FROM settings WHERE key = 'proof_channel_id'").fetchone()
     
-    message_text = f"📢 *Proof Channel Management*\n\nCurrent Channel ID: `{current_proof[0] if current_proof else 'Not Set'}`\n\nWhen a withdrawal is approved, details will be posted here."
+    msg = f"📢 *Proof Channel Management*\n\nCurrent Proof Channel: `{current_proof[0] if current_proof else 'Not Set'}`\n\nApproved withdrawals will be posted here."
     keyboard = [[InlineKeyboardButton("🛠 Set Proof Channel", callback_data="admin_set_proof_start")]]
-    await update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 async def set_proof_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> State:
     await update.callback_query.message.delete()
@@ -283,7 +288,7 @@ async def save_proof_channel(update: Update, context: ContextTypes.DEFAULT_TYPE)
     channel_id = update.message.text.strip()
     with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('proof_channel_id', ?)", ('proof_channel_id', channel_id))
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", ('proof_channel_id', channel_id))
         conn.commit()
     await update.message.reply_text(f"✅ Proof Channel successfully set to: `{channel_id}`", reply_markup=get_admin_keyboard())
     return ConversationHandler.END
@@ -316,7 +321,7 @@ async def handle_admin_withdrawals(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_text("--- 🏧 Pending Withdrawals ---")
     for w_id, u_name, amount, network, address in withdrawals:
         message = f"ID: `{w_id}` | User: @{u_name or 'N/A'}\nAmount: **${amount:.2f}** ({network})\nAddress: `{address}`"
-        keyboard = [[InlineKeyboardButton(f"✅ Approve", callback_data=f"approve_{w_id}"), InlineKeyboardButton(f"❌ Reject", callback_data=f"reject_{w_id}")]]
+        keyboard = [[InlineKeyboardButton(f"✅ Approve #{w_id}", callback_data=f"approve_{w_id}"), InlineKeyboardButton(f"❌ Reject #{w_id}", callback_data=f"reject_{w_id}")]]
         await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 async def handle_admin_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -702,7 +707,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         action, withdrawal_id = data.split("_")
         with sqlite3.connect(DB_FILE, check_same_thread=False) as conn:
             c = conn.cursor()
-            # UPDATED: Fetching user details for Proof Channel
             res = c.execute("SELECT w.user_id, w.amount, w.network, w.wallet_address, u.first_name FROM withdrawals w JOIN users u ON w.user_id = u.user_id WHERE w.withdrawal_id = ?", (withdrawal_id,)).fetchone()
             if not res: return
             w_user_id, amount, network, address, first_name = res
@@ -711,20 +715,20 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                 c.execute("UPDATE withdrawals SET status = 'approved' WHERE withdrawal_id = ?", (withdrawal_id,)); conn.commit()
                 await context.bot.send_message(chat_id=w_user_id, text=f"🎉 Approved ${amount:.2f}!")
                 
-                # ADDED: Payment Proof Post Logic
-                proof_channel = c.execute("SELECT value FROM settings WHERE key = 'proof_channel_id'").fetchone()
-                if proof_channel:
-                    now_str = datetime.now().strftime("%-m/%-d/%Y %-I:%M:%S %p")
+                # POST TO PROOF CHANNEL
+                proof_chan = c.execute("SELECT value FROM settings WHERE key = 'proof_channel_id'").fetchone()
+                if proof_chan:
+                    time_now = datetime.now().strftime("%-m/%-d/%Y %-I:%M:%S %p")
                     proof_msg = (f"🔎 Withdrawal Details\n"
                                  f"🆔 ID: {withdrawal_id}\n"
                                  f"👤 User: {first_name} ({w_user_id})\n"
                                  f"💰 Amount: {amount}\n"
                                  f"⛓ Network: {network}\n"
                                  f"📍 Address: {address}\n"
-                                 f"⏰ Time: {now_str}\n"
+                                 f"⏰ Time: {time_now}\n"
                                  f"✅ Status : Paid")
                     try:
-                        await context.bot.send_message(chat_id=proof_channel[0], text=proof_msg)
+                        await context.bot.send_message(chat_id=proof_chan[0], text=proof_msg)
                     except Exception as e:
                         logger.error(f"Failed to post proof: {e}")
                 
@@ -750,7 +754,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     elif data == "back_to_admin_tracking": await handle_admin_tracking(update, context)
     elif data == "back_to_coupon_menu": await handle_coupon_management(update, context)
     elif data == "admin_coupon_history": await handle_coupon_history(update, context)
-    elif data == "admin_set_proof_start": await set_proof_channel_start(update, context) # ADDED: Callback
+    # Proof channel entry is handled by ConversationHandler now
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
@@ -789,7 +793,7 @@ def main() -> None:
         elif text == "📊 Bot Stats": await handle_admin_stats(update, context)
         elif text == "🏧 Withdrawals": await handle_admin_withdrawals(update, context)
         elif text == "🔗 Main Track Management": await handle_admin_tracking(update, context)
-        elif text == "📢 Proof Channel": await handle_admin_proof_channel(update, context) # ADDED
+        elif text == "📢 Proof Channel": await handle_admin_proof_channel(update, context)
         elif text == "⬅️ Back to User Menu": await admin_back_to_user_menu(update, context)
         return ConversationHandler.END
 
@@ -802,8 +806,8 @@ def main() -> None:
     add_coupon_tracked_conv = ConversationHandler(entry_points=[CallbackQueryHandler(add_coupon_tracked_channel_start, pattern="^admin_add_coupon_tracked_start$")], states={State.GET_COUPON_TRACKED_NAME: [MessageHandler(non_menu_text_filter, get_coupon_tracked_name)], State.GET_COUPON_TRACKED_ID: [MessageHandler(non_menu_text_filter, get_coupon_tracked_id)], State.GET_COUPON_TRACKED_URL: [MessageHandler(non_menu_text_filter, get_coupon_tracked_url_and_save)]}, fallbacks=conv_fallbacks, per_message=False)
     withdraw_conv = ConversationHandler(entry_points=[MessageHandler(filters.Regex("^💸 Withdraw$"), withdraw_start)], states={State.CHOOSE_WITHDRAW_NETWORK: [CallbackQueryHandler(choose_withdraw_network, pattern="^w_net_")], State.GET_WALLET_ADDRESS: [MessageHandler(non_menu_text_filter, get_wallet_address)], State.GET_WITHDRAW_AMOUNT: [MessageHandler(non_menu_text_filter, get_withdraw_amount)]}, fallbacks=conv_fallbacks, per_message=False)
     claim_coupon_conv = ConversationHandler(entry_points=[MessageHandler(filters.Regex("^🎟️ Coupon Code$"), claim_coupon_start)], states={State.AWAIT_COUPON_CODE: [MessageHandler(non_menu_text_filter, receive_coupon_code), CallbackQueryHandler(claim_coupon_start, pattern="^verify_coupon_membership$")]}, fallbacks=conv_fallbacks, per_message=False)
-    # ADDED: Proof Channel Conversation
-    proof_chan_conv = ConversationHandler(entry_points=[CallbackQueryHandler(set_proof_channel_start, pattern="^admin_set_proof_start$")], states={State.SET_PROOF_CHANNEL: [MessageHandler(non_menu_text_filter, save_proof_channel)]}, fallbacks=conv_fallbacks, per_message=False)
+    # Correct entry point for proof channel setting
+    proof_chan_conv = ConversationHandler(entry_points=[CallbackQueryHandler(set_proof_channel_start, pattern="^admin_set_proof_start$")], states={State.SET_PROOF_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_proof_channel)]}, fallbacks=conv_fallbacks, per_message=False)
     
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~any_menu_button_filter, gatekeeper_handler), group=-1)
     application.add_handler(add_task_conv); application.add_handler(withdraw_conv); application.add_handler(mailing_conv); application.add_handler(add_tracked_conv)
@@ -820,10 +824,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.Regex("^🏧 Withdrawals$"), handle_admin_withdrawals))
     application.add_handler(MessageHandler(filters.Regex("^🔗 Main Track Management$"), handle_admin_tracking))
     application.add_handler(MessageHandler(filters.Regex("^🎟️ Coupon Management$"), handle_coupon_management))
-    application.add_handler(MessageHandler(filters.Regex("^📢 Proof Channel$"), handle_admin_proof_channel)) # ADDED
-    application.add_handler(CallbackQueryHandler(delete_task_list, pattern="^admin_delete_task_list$"))
-    application.add_handler(CallbackQueryHandler(remove_tracked_channel_list, pattern="^admin_remove_tracked_list$"))
-    application.add_handler(CallbackQueryHandler(remove_coupon_tracked_channel_list, pattern="^admin_remove_coupon_tracked_list$"))
+    application.add_handler(MessageHandler(filters.Regex("^📢 Proof Channel$"), handle_admin_proof_channel))
     application.add_handler(CallbackQueryHandler(button_callback_handler))
 
     application.run_polling()
