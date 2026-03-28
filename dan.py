@@ -3,6 +3,7 @@ import sqlite3
 import io
 import os
 import random
+import asyncio
 from datetime import datetime, date
 from enum import Enum
 
@@ -16,7 +17,7 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest, Forbidden
 
-# --- Configuration (Choreo Ready) ---
+# --- Configuration ---
 BOT_API_KEY = os.environ.get("BOT_API_KEY") 
 ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 
@@ -24,7 +25,6 @@ REFERRAL_BONUS = 0.05
 DAILY_BONUS = 0.05
 MIN_WITHDRAWAL_LIMIT = 5.00
 
-# Persistence Setup
 DATA_DIR = os.environ.get('DATA_DIR', '.')
 DB_FILE = os.path.join(DATA_DIR, "user_data.db")
 
@@ -39,11 +39,10 @@ class State(Enum):
     CHOOSE_WITHDRAW_NETWORK = 5; GET_WALLET_ADDRESS = 6; GET_WITHDRAW_AMOUNT = 7
     # Mailing
     GET_MAIL_MESSAGE = 8; AWAIT_BUTTON_OR_SEND = 9; GET_BUTTON_DATA = 10
-    # Tracking
+    # Tracking (Forced Join)
     GET_TRACKED_NAME = 11; GET_TRACKED_ID = 12; GET_TRACKED_URL = 13
     # Coupons
     GET_COUPON_BUDGET = 14; GET_COUPON_MAX_CLAIMS = 15; AWAIT_COUPON_CODE = 16
-    GET_COUPON_TRACKED_NAME = 17; GET_COUPON_TRACKED_ID = 18; GET_COUPON_TRACKED_URL = 19
 
 # --- Database Initialization ---
 def setup_database():
@@ -54,10 +53,8 @@ def setup_database():
         c.execute("CREATE TABLE IF NOT EXISTS completed_tasks (user_id INTEGER, task_id INTEGER, PRIMARY KEY (user_id, task_id))")
         c.execute("CREATE TABLE IF NOT EXISTS withdrawals (withdrawal_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, amount REAL NOT NULL, network TEXT NOT NULL, wallet_address TEXT NOT NULL, status TEXT DEFAULT 'pending', request_date DATETIME DEFAULT CURRENT_TIMESTAMP)")
         c.execute("CREATE TABLE IF NOT EXISTS forced_channels (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_name TEXT, channel_id TEXT UNIQUE, channel_url TEXT, status TEXT DEFAULT 'active')")
-        c.execute("CREATE TABLE IF NOT EXISTS coupons (coupon_code TEXT PRIMARY KEY, budget REAL NOT NULL, max_claims INTEGER NOT NULL, claims_count INTEGER DEFAULT 0, status TEXT DEFAULT 'active', creation_date DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        c.execute("CREATE TABLE IF NOT EXISTS coupons (coupon_code TEXT PRIMARY KEY, budget REAL NOT NULL, max_claims INTEGER NOT NULL, claims_count INTEGER DEFAULT 0, status TEXT DEFAULT 'active')")
         c.execute("CREATE TABLE IF NOT EXISTS claimed_coupons (user_id INTEGER, coupon_code TEXT, PRIMARY KEY (user_id, coupon_code))")
-        c.execute("CREATE TABLE IF NOT EXISTS coupon_forced_channels (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_name TEXT, channel_id TEXT UNIQUE, channel_url TEXT, status TEXT DEFAULT 'active')")
-        c.execute("CREATE TABLE IF NOT EXISTS coupon_messages (coupon_code TEXT, chat_id INTEGER, message_id INTEGER, PRIMARY KEY (coupon_code, chat_id))")
         conn.commit()
 
 # --- Keyboards ---
@@ -80,10 +77,10 @@ def get_admin_keyboard():
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-# --- Membership & Helper Functions ---
-async def get_unjoined_channels(user_id, context, table_name):
+# --- Membership Helpers ---
+async def get_unjoined_channels(user_id, context):
     with sqlite3.connect(DB_FILE) as conn:
-        channels = conn.cursor().execute(f"SELECT channel_name, channel_id, channel_url FROM {table_name} WHERE status = 'active'").fetchall()
+        channels = conn.cursor().execute("SELECT channel_name, channel_id, channel_url FROM forced_channels WHERE status = 'active'").fetchall()
     unjoined = []
     for name, cid, url in channels:
         try:
@@ -93,10 +90,10 @@ async def get_unjoined_channels(user_id, context, table_name):
         except: continue
     return unjoined
 
-async def is_member_or_send_join_message(update, context, table='forced_channels'):
+async def is_member_or_send_join_message(update, context):
     user_id = update.effective_user.id
     if user_id == ADMIN_ID: return True
-    unjoined = await get_unjoined_channels(user_id, context, table)
+    unjoined = await get_unjoined_channels(user_id, context)
     if unjoined:
         text = "⚠️ **Action Required**\n\nYou must join our channels to continue:"
         kb = [[InlineKeyboardButton(f"➡️ Join {c['name']}", url=c['url'])] for c in unjoined]
@@ -113,14 +110,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c = conn.cursor()
         c.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user.id, user.username))
         
-        # Referral Logic
-        if context.args and not c.execute("SELECT referred_by FROM users WHERE user_id = ?", (user.id,)).fetchone()[0]:
+        if context.args: # Referral logic
             try:
                 ref_id = int(context.args[0])
-                if ref_id != user.id:
-                    c.execute("UPDATE users SET balance = balance + ?, referred_by = ? WHERE user_id = ?", (REFERRAL_BONUS, ref_id, user.id))
+                existing_ref = c.execute("SELECT referred_by FROM users WHERE user_id = ?", (user.id,)).fetchone()
+                if ref_id != user.id and (not existing_ref or existing_ref[0] is None):
+                    c.execute("UPDATE users SET referred_by = ? WHERE user_id = ?", (ref_id, user.id))
                     c.execute("UPDATE users SET balance = balance + ?, referral_count = referral_count + 1 WHERE user_id = ?", (REFERRAL_BONUS, ref_id))
-                    conn.commit()
                     try: await context.bot.send_message(ref_id, f"✅ **New Referral!**\nYou earned ${REFERRAL_BONUS:.2f}", parse_mode='Markdown')
                     except: pass
             except: pass
@@ -153,7 +149,7 @@ async def handle_daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE)
         conn.commit()
     await update.message.reply_text(f"🎁 Daily Bonus: **+${DAILY_BONUS}**!")
 
-# --- Task Flow (Direct) ---
+# --- Task Flow ---
 async def tasks_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await is_member_or_send_join_message(update, context):
         await show_next_task(update, context)
@@ -175,15 +171,13 @@ async def show_next_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tid, name, reward, url = task
     text = f"📋 **Task**: {name}\n💰 **Reward**: ${reward:.2f}"
-    kb = [
-        [InlineKeyboardButton("➡️ Open Link", url=url)],
-        [InlineKeyboardButton("✅ Verify", callback_data=f"task_v_{tid}"),
-         InlineKeyboardButton("⏭️ Skip", callback_data=f"task_s_{tid}")]
-    ]
+    kb = [[InlineKeyboardButton("➡️ Open Link", url=url)],
+          [InlineKeyboardButton("✅ Verify", callback_data=f"task_v_{tid}"), InlineKeyboardButton("⏭️ Skip", callback_data=f"task_s_{tid}")]]
+    
     if update.callback_query: await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
     else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
-# --- Withdrawal System ---
+# --- Withdrawal Flow ---
 async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     with sqlite3.connect(DB_FILE) as conn:
@@ -204,7 +198,9 @@ async def save_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYP
         with sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
             bal = c.execute("SELECT balance FROM users WHERE user_id = ?", (uid,)).fetchone()[0]
-            if amt < 1.0 or amt > bal: await update.message.reply_text("Invalid amount."); return State.GET_WITHDRAW_AMOUNT
+            if amt < 1.0 or amt > bal:
+                await update.message.reply_text(f"Invalid amount. Max: {bal}")
+                return State.GET_WITHDRAW_AMOUNT
             
             c.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amt, uid))
             c.execute("INSERT INTO withdrawals (user_id, amount, network, wallet_address) VALUES (?,?,?,?)", 
@@ -213,191 +209,181 @@ async def save_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYP
             conn.commit()
             
         await update.message.reply_text("✅ Withdrawal Request Sent!", reply_markup=get_user_keyboard(uid))
-        await context.bot.send_message(ADMIN_ID, f"🏧 **New Request**\nID: `{wid}`\nUser: `{uid}`\nAmt: `${amt:.2f}`\nWallet: `{context.user_data['adr']}`", parse_mode='Markdown')
+        await context.bot.send_message(ADMIN_ID, f"🏧 **New Request**\nID: `{wid}`\nAmt: `${amt:.2f}`", parse_mode='Markdown')
         return ConversationHandler.END
-    except: await update.message.reply_text("Enter a number:"); return State.GET_WITHDRAW_AMOUNT
+    except ValueError:
+        await update.message.reply_text("Please enter a valid number.")
+        return State.GET_WITHDRAW_AMOUNT
 
-# --- Coupon System ---
-async def generate_coupon_text(code, budget, max_c, claims):
-    return f"🎁 **COUPON CODE** 🎁\n\nCode: `{code}`\nBudget: ${budget:.2f}\nClaims: {claims}/{max_c}\n\n➡️ @{(await Application.get_instance().bot.get_me()).username}"
+# --- Admin Function: Stats (THE FIX) ---
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        total_u = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        total_b = c.execute("SELECT SUM(balance) FROM users").fetchone()[0] or 0
+        active_t = c.execute("SELECT COUNT(*) FROM tasks WHERE status = 'active'").fetchone()[0]
+        pend_w = c.execute("SELECT COUNT(*) FROM withdrawals WHERE status = 'pending'").fetchone()[0]
+    
+    stats = (f"📊 **Bot Stats**\n\n"
+             f"👥 Total Users: {total_u}\n"
+             f"💰 Total Balance: ${total_b:.2f}\n"
+             f"📋 Active Tasks: {active_t}\n"
+             f"🏧 Pending Withdrawals: {pend_w}")
+    await update.message.reply_text(stats, parse_mode='Markdown')
 
-async def receive_coupon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Admin Function: Mailing ---
+async def admin_mailing_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
+    await update.message.reply_text("Send the message you want to broadcast (Text/Image/Video):")
+    return State.GET_MAIL_MESSAGE
+
+async def receive_mail_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['broadcast_msg'] = update.message
+    kb = [[InlineKeyboardButton("Add Button", callback_data="mail_add_btn"), 
+           InlineKeyboardButton("🚀 Send Now", callback_data="mail_send_now")]]
+    await update.message.reply_text("Preview saved. Add a button or send?", reply_markup=InlineKeyboardMarkup(kb))
+    return State.AWAIT_BUTTON_OR_SEND
+
+async def broadcast_mailing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Broadcasting...")
+    with sqlite3.connect(DB_FILE) as conn:
+        users = conn.cursor().execute("SELECT user_id FROM users").fetchall()
+    
+    msg = context.user_data['broadcast_msg']
+    btn_kb = context.user_data.get('broadcast_kb')
+    
+    success, fail = 0, 0
+    for (uid,) in users:
+        try:
+            await msg.copy(chat_id=uid, reply_markup=btn_kb)
+            success += 1
+            await asyncio.sleep(0.05) # Rate limit protection
+        except: fail += 1
+    
+    await query.message.reply_text(f"📢 Broadcast Complete\n✅ Success: {success}\n❌ Failed: {fail}")
+    return ConversationHandler.END
+
+# --- Coupon Management ---
+async def coupon_mgmt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    kb = [[InlineKeyboardButton("➕ Create Coupon", callback_data="c_add")]]
+    await update.message.reply_text("🎟️ Coupon Management", reply_markup=InlineKeyboardMarkup(kb))
+
+async def handle_coupon_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = update.message.text.strip().upper()
     uid = update.effective_user.id
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
-        data = c.execute("SELECT budget, max_claims, claims_count, status FROM coupons WHERE coupon_code = ?", (code,)).fetchone()
-        if not data or data[3] != 'active' or data[2] >= data[1]: await update.message.reply_text("❌ Invalid/Expired."); return ConversationHandler.END
-        if c.execute("SELECT 1 FROM claimed_coupons WHERE user_id = ? AND coupon_code = ?", (uid, code)).fetchone(): await update.message.reply_text("⚠️ Already claimed."); return ConversationHandler.END
+        coupon = c.execute("SELECT budget, max_claims, claims_count FROM coupons WHERE coupon_code = ? AND status = 'active'", (code,)).fetchone()
+        if not coupon: 
+            await update.message.reply_text("❌ Invalid or expired code.")
+            return
         
-        reward = data[0] / data[1]
+        already = c.execute("SELECT 1 FROM claimed_coupons WHERE user_id = ? AND coupon_code = ?", (uid, code)).fetchone()
+        if already:
+            await update.message.reply_text("⚠️ You already claimed this!")
+            return
+
+        if coupon[2] >= coupon[1]:
+            await update.message.reply_text("❌ Coupon limit reached.")
+            return
+
+        reward = coupon[0] / coupon[1]
         c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (reward, uid))
-        c.execute("INSERT INTO claimed_coupons (user_id, coupon_code) VALUES (?, ?)", (uid, code))
+        c.execute("INSERT INTO claimed_coupons (user_id, coupon_code) VALUES (?,?)", (uid, code))
         c.execute("UPDATE coupons SET claims_count = claims_count + 1 WHERE coupon_code = ?", (code,))
         conn.commit()
-        await update.message.reply_text(f"🎉 Claimed! +${reward:.2f}")
-        
-        # Live update channel message
-        msg = c.execute("SELECT chat_id, message_id FROM coupon_messages WHERE coupon_code = ?", (code,)).fetchone()
-        if msg:
-            try: await context.bot.edit_message_text(await generate_coupon_text(code, data[0], data[1], data[2]+1), chat_id=msg[0], message_id=msg[1], parse_mode='Markdown')
-            except: pass
-    return ConversationHandler.END
+        await update.message.reply_text(f"🎉 Success! You received ${reward:.2f}")
 
-# --- Admin Logic (Stats, Management, Mailing) ---
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id == ADMIN_ID:
-        await update.message.reply_text("👑 Admin Mode", reply_markup=get_admin_keyboard())
-
-async def admin_withdrawals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    with sqlite3.connect(DB_FILE) as conn:
-        reqs = conn.cursor().execute("SELECT withdrawal_id, user_id, amount, network, wallet_address FROM withdrawals WHERE status = 'pending'").fetchall()
-    if not reqs: await update.message.reply_text("No pending withdrawals."); return
-    for r in reqs:
-        txt = f"ID: {r[0]}\nUser: {r[1]}\nAmt: ${r[2]}\nNet: {r[3]}\nWallet: `{r[4]}`"
-        kb = [[InlineKeyboardButton("✅ Approve", callback_data=f"p_app_{r[0]}"), 
-               InlineKeyboardButton("❌ Reject", callback_data=f"p_rej_{r[0]}")]]
-        await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
-
-async def admin_mailing_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
-    await update.message.reply_text("Send the message for broadcast (Text/Photo/Video):")
-    return State.GET_MAIL_MESSAGE
-
-async def broadcast_mailing(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    with sqlite3.connect(DB_FILE) as conn: users = conn.cursor().execute("SELECT user_id FROM users").fetchall()
-    msg = context.user_data['mail_msg']
-    kb = InlineKeyboardMarkup([context.user_data['btns']]) if 'btns' in context.user_data else None
-    s, f = 0, 0
-    for (uid,) in users:
-        try: await msg.copy(chat_id=uid, reply_markup=kb); s += 1
-        except: f += 1
-    await query.message.reply_text(f"📢 Done!\nSuccess: {s} | Fail: {f}")
-    return ConversationHandler.END
-
-# --- Admin Task & Tracking Logic ---
-async def admin_task_mgmt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    kb = [[InlineKeyboardButton("➕ Add Task", callback_data="a_t_add"), InlineKeyboardButton("🗑️ Delete Task", callback_data="a_t_del")]]
-    await update.message.reply_text("📋 Task Management:", reply_markup=InlineKeyboardMarkup(kb))
-
-async def admin_track_mgmt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    kb = [[InlineKeyboardButton("➕ Add Main Channel", callback_data="a_tr_add"), InlineKeyboardButton("🗑️ Remove Channel", callback_data="a_tr_del")]]
-    await update.message.reply_text("🔗 Forced Join Management:", reply_markup=InlineKeyboardMarkup(kb))
-
-# --- Global Callback Router (The Brain) ---
+# --- Global Callback Router ---
 async def global_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
     uid = query.from_user.id
-    
-    # Task Callbacks
-    if data.startswith("task_"):
-        await query.answer()
-        act, tid = data.split("_")[1], int(data.split("_")[2])
-        with sqlite3.connect(DB_FILE) as conn:
-            c = conn.cursor()
-            if act == 's': c.execute("INSERT INTO completed_tasks (user_id, task_id) VALUES (?,?)", (uid, tid)); conn.commit(); await show_next_task(update, context)
-            else:
-                task = c.execute("SELECT reward, target_chat_id FROM tasks WHERE task_id = ?", (tid,)).fetchone()
-                try:
-                    m = await context.bot.get_chat_member(task[1], uid)
-                    if m.status in ['member', 'administrator', 'creator']:
-                        c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (task[0], uid))
-                        c.execute("INSERT INTO completed_tasks (user_id, task_id) VALUES (?,?)", (uid, tid))
-                        conn.commit(); await query.answer("Success!", show_alert=True); await show_next_task(update, context)
-                    else: await query.answer("❌ Not joined!", show_alert=True)
-                except: await query.answer("Bot needs Admin in channel.")
 
-    # Withdrawal Approval
-    elif data.startswith("p_"):
-        act, wid = data.split("_")[1], int(data.split("_")[2])
-        with sqlite3.connect(DB_FILE) as conn:
-            c = conn.cursor()
-            req = c.execute("SELECT user_id, amount FROM withdrawals WHERE withdrawal_id = ?", (wid,)).fetchone()
-            if act == 'app':
-                c.execute("UPDATE withdrawals SET status = 'approved' WHERE withdrawal_id = ?", (wid,))
-                await context.bot.send_message(req[0], f"✅ Withdrawal of ${req[1]} approved!")
-            else:
-                c.execute("UPDATE withdrawals SET status = 'rejected' WHERE withdrawal_id = ?", (wid,))
-                c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (req[1], req[0]))
-                await context.bot.send_message(req[0], f"❌ Withdrawal of ${req[1]} rejected. Funds returned.")
-            conn.commit(); await query.message.delete()
-
-    # Track Management Delete
-    elif data == "a_tr_del":
-        with sqlite3.connect(DB_FILE) as conn:
-            chans = conn.cursor().execute("SELECT id, channel_name FROM forced_channels WHERE status = 'active'").fetchall()
-        kb = [[InlineKeyboardButton(f"🗑️ {c[1]}", callback_data=f"tr_rem_{c[0]}")] for c in chans]
-        await query.edit_message_text("Select channel to remove:", reply_markup=InlineKeyboardMarkup(kb))
-    elif data.startswith("tr_rem_"):
-        cid = int(data.split("_")[2])
-        with sqlite3.connect(DB_FILE) as conn: conn.cursor().execute("UPDATE forced_channels SET status = 'deleted' WHERE id = ?", (cid,)); conn.commit()
-        await query.answer("Removed."); await query.message.delete()
-
-    # Task Management Delete
-    elif data == "a_t_del":
-        with sqlite3.connect(DB_FILE) as conn:
-            tsks = conn.cursor().execute("SELECT task_id, task_name FROM tasks WHERE status = 'active'").fetchall()
-        kb = [[InlineKeyboardButton(f"🗑️ {t[1]}", callback_data=f"t_rem_{t[0]}")] for t in tsks]
-        await query.edit_message_text("Select task to delete:", reply_markup=InlineKeyboardMarkup(kb))
-    elif data.startswith("t_rem_"):
+    if data.startswith("task_v_"): # Task Verify
         tid = int(data.split("_")[2])
-        with sqlite3.connect(DB_FILE) as conn: conn.cursor().execute("UPDATE tasks SET status = 'deleted' WHERE task_id = ?", (tid,)); conn.commit()
-        await query.answer("Deleted."); await query.message.delete()
+        with sqlite3.connect(DB_FILE) as conn:
+            target_id = conn.cursor().execute("SELECT target_chat_id, reward FROM tasks WHERE task_id = ?", (tid,)).fetchone()
+            try:
+                member = await context.bot.get_chat_member(target_id[0], uid)
+                if member.status in ['member', 'administrator', 'creator']:
+                    conn.cursor().execute("INSERT INTO completed_tasks (user_id, task_id) VALUES (?,?)", (uid, tid))
+                    conn.cursor().execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (target_id[1], uid))
+                    conn.commit()
+                    await query.answer("✅ Verified! Reward added.", show_alert=True)
+                    await show_next_task(update, context)
+                else: await query.answer("❌ You haven't joined yet!", show_alert=True)
+            except: await query.answer("Error verifying. Ensure bot is admin in channel.")
 
-    # Misc
+    elif data == "mail_send_now":
+        return await broadcast_mailing(update, context)
+    
     elif data == "verify_membership":
-        if await is_member_or_send_join_message(update, context): await query.message.delete(); await query.message.reply_text("✅ Access Granted!", reply_markup=get_user_keyboard(uid))
+        if await is_member_or_send_join_message(update, context):
+            await query.message.delete()
+            await query.message.reply_text("✅ Access Granted!", reply_markup=get_user_keyboard(uid))
 
-# --- Main App ---
+# --- Main App Execution ---
 def main():
     setup_database()
     app = Application.builder().token(BOT_API_KEY).build()
 
-    # Admin Conversation Handlers
-    task_add = ConversationHandler(
-        entry_points=[CallbackQueryHandler(lambda u,c: u.callback_query.message.reply_text("Task Name:"), pattern="^a_t_add$")],
-        states={
-            State.GET_TASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u,c: (c.user_data.update({'tn':u.message.text}), u.message.reply_text("Channel ID:"), State.GET_TARGET_CHAT_ID)[2])],
-            State.GET_TARGET_CHAT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u,c: (c.user_data.update({'tc':u.message.text}), u.message.reply_text("Task URL:"), State.GET_TASK_URL)[2])],
-            State.GET_TASK_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u,c: (c.user_data.update({'tu':u.message.text}), u.message.reply_text("Reward:"), State.GET_TASK_REWARD)[2])],
-            State.GET_TASK_REWARD: [MessageHandler(filters.TEXT, lambda u,c: (sqlite3.connect(DB_FILE).cursor().execute("INSERT INTO tasks (task_name, reward, target_chat_id, task_url) VALUES (?,?,?,?)", (c.user_data['tn'], float(u.message.text), c.user_data['tc'], c.user_data['tu'])), sqlite3.connect(DB_FILE).commit(), u.message.reply_text("✅ Done!", reply_markup=get_admin_keyboard()), ConversationHandler.END)[3])]
-        }, fallbacks=[]
-    )
-
+    # --- Conversation Handlers ---
+    
+    # Withdrawal
     withdraw_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💸 Withdraw$"), withdraw_start)],
         states={
-            State.CHOOSE_WITHDRAW_NETWORK: [CallbackQueryHandler(lambda u,c: (c.user_data.update({'net':u.callback_query.data.split("_")[2]}), u.callback_query.edit_message_text("Wallet:"), State.GET_WALLET_ADDRESS)[2], pattern="^w_net_")],
-            State.GET_WALLET_ADDRESS: [MessageHandler(filters.TEXT, lambda u,c: (c.user_data.update({'adr':u.message.text}), u.message.reply_text("Amount:"), State.GET_WITHDRAW_AMOUNT)[2])],
-            State.GET_WITHDRAW_AMOUNT: [MessageHandler(filters.TEXT, save_withdraw_amount)]
+            State.CHOOSE_WITHDRAW_NETWORK: [CallbackQueryHandler(lambda u,c: (c.user_data.update({'net':u.callback_query.data.split("_")[2]}), u.callback_query.edit_message_text("Send Wallet Address:"), State.GET_WALLET_ADDRESS)[2], pattern="^w_net_")],
+            State.GET_WALLET_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u,c: (c.user_data.update({'adr':u.message.text}), u.message.reply_text("Enter Amount:"), State.GET_WITHDRAW_AMOUNT)[2])],
+            State.GET_WITHDRAW_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_withdraw_amount)]
+        }, fallbacks=[CommandHandler("cancel", start)]
+    )
+
+    # Mailing
+    mailing_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📧 Mailing$"), admin_mailing_start)],
+        states={
+            State.GET_MAIL_MESSAGE: [MessageHandler(filters.ALL & ~filters.COMMAND, receive_mail_content)],
+            State.AWAIT_BUTTON_OR_SEND: [CallbackQueryHandler(global_callback)]
+        }, fallbacks=[CommandHandler("cancel", start)]
+    )
+
+    # Task Add
+    task_add_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(lambda u,c: (u.callback_query.message.reply_text("Task Name:"), State.GET_TASK_NAME)[1], pattern="^a_t_add$")],
+        states={
+            State.GET_TASK_NAME: [MessageHandler(filters.TEXT, lambda u,c: (c.user_data.update({'tn':u.message.text}), u.message.reply_text("Channel ID:"), State.GET_TARGET_CHAT_ID)[2])],
+            State.GET_TARGET_CHAT_ID: [MessageHandler(filters.TEXT, lambda u,c: (c.user_data.update({'tc':u.message.text}), u.message.reply_text("Task URL:"), State.GET_TASK_URL)[2])],
+            State.GET_TASK_URL: [MessageHandler(filters.TEXT, lambda u,c: (c.user_data.update({'tu':u.message.text}), u.message.reply_text("Reward:"), State.GET_TASK_REWARD)[2])],
+            State.GET_TASK_REWARD: [MessageHandler(filters.TEXT, lambda u,c: (sqlite3.connect(DB_FILE).cursor().execute("INSERT INTO tasks (task_name, reward, target_chat_id, task_url) VALUES (?,?,?,?)", (c.user_data['tn'], float(u.message.text), c.user_data['tc'], c.user_data['tu'])), sqlite3.connect(DB_FILE).commit(), u.message.reply_text("✅ Task Added!"), ConversationHandler.END)[3])]
         }, fallbacks=[]
     )
 
+    # --- Register Handlers ---
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex("^💰 Balance$"), handle_balance))
     app.add_handler(MessageHandler(filters.Regex("^👥 Referral$"), handle_referral))
     app.add_handler(MessageHandler(filters.Regex("^🎁 Daily Bonus$"), handle_daily_bonus))
     app.add_handler(MessageHandler(filters.Regex("^📋 Tasks$"), tasks_entry))
-    app.add_handler(MessageHandler(filters.Regex("^🎟️ Coupon Code$"), lambda u,c: (u.message.reply_text("Enter Code:"), State.AWAIT_COUPON_CODE)[1]))
-    app.add_handler(MessageHandler(filters.Regex("^👑 Admin Panel$"), admin_panel))
-    app.add_handler(MessageHandler(filters.Regex("^📧 Mailing$"), admin_mailing_start))
-    app.add_handler(MessageHandler(filters.Regex("^🏧 Withdrawals$"), admin_withdrawals))
-    app.add_handler(MessageHandler(filters.Regex("^📋 Task Management$"), admin_task_mgmt))
-    app.add_handler(MessageHandler(filters.Regex("^🔗 Main Track Management$"), admin_track_mgmt))
+    app.add_handler(MessageHandler(filters.Regex("^👑 Admin Panel$"), lambda u,c: u.message.reply_text("👑 Admin Panel", reply_markup=get_admin_keyboard()) if u.effective_user.id == ADMIN_ID else None))
     app.add_handler(MessageHandler(filters.Regex("^📊 Bot Stats$"), admin_stats))
+    app.add_handler(MessageHandler(filters.Regex("^📋 Task Management$"), lambda u,c: u.message.reply_text("Tasks:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add Task", callback_data="a_t_add")]])) if u.effective_user.id == ADMIN_ID else None))
     app.add_handler(MessageHandler(filters.Regex("^⬅️ Back to User Menu$"), start))
+    app.add_handler(MessageHandler(filters.Regex("^🎟️ Coupon Code$"), lambda u,c: u.message.reply_text("Enter your coupon code:")))
+    
+    # Specific Message Handler for Coupons (Catch-all text that isn't a command/button)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.UpdateType.EDITED_MESSAGE, handle_coupon_redeem))
 
-    app.add_handler(task_add)
     app.add_handler(withdraw_conv)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_coupon)) # For Coupon logic
+    app.add_handler(mailing_conv)
+    app.add_handler(task_add_conv)
     app.add_handler(CallbackQueryHandler(global_callback))
 
-    print("Bot is starting...")
+    print("Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
